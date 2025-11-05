@@ -62,7 +62,7 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
     const y = 80 + Math.random() * 200
     const id = uid(type[0].toUpperCase())
     const labelBase = { source: 'Source', breaker: 'CB', bus: 'Bus', load: 'Load' }[type]
-    setDiagram(d => ({ ...d, nodes: [...d.nodes, { id, type, x, y, label: `${labelBase} ${id}`, ...(type === 'breaker' ? { closed: True } : {}) }] }))
+    setDiagram(d => ({ ...d, nodes: [...d.nodes, { id, type, x, y, label: `${labelBase} ${id}`, ...(type === 'breaker' ? { closed: true } : {}) }] }))
   }const startConnect = (from: NodeId) => {
     if (lockedView) return
     if (connectFrom && connectFrom !== from) {
