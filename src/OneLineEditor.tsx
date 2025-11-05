@@ -7,12 +7,11 @@ type NodeId = string;
 type Node = {
   id: NodeId;
   type: NodeType;
-  x: number; y: number;
+  x: number;
+  y: number;
   label: string;
-  // For sources and converters:
-  sourceSignal?: Signal;       // only if type === "source"
-  // For breakers:
-  closed?: boolean;            // only if type === "breaker"
+  sourceSignal?: Signal; // only for type === "source"
+  closed?: boolean;      // only for type === "breaker"
 };
 
 type Edge = {
@@ -32,42 +31,33 @@ const STARTER: Diagram = {
     { id: "GEN",  type: "source",   x: 120, y: 240, label: "Generator (AC Source)", sourceSignal: "AC" },
     { id: "BRK_GEN",  type: "breaker", x: 260, y: 240, label: "CB-GEN", closed: false },
     { id: "BUS",  type: "bus",      x: 440, y: 160, label: "Main Bus" },
-    // Example UPS block (rectifier-DC-link-inverter) – you can wire these up later:
     { id: "RECT1", type: "rectifier", x: 520, y: 80,  label: "Rectifier" },
     { id: "INV1",  type: "inverter",  x: 520, y: 240, label: "Inverter" },
-    { id: "LOAD", type: "load",     x: 680, y: 160, label: "Critical Load" },
+    { id: "LOAD", type: "load",     x: 680, y: 160, label: "Critical Load" }
   ],
   edges: [
     { id: "E1", from: "UTIL",     fromPort: 0, to: "BRK_UTIL", toPort: 0 },
     { id: "E2", from: "BRK_UTIL", fromPort: 1, to: "BUS",      toPort: 0 },
     { id: "E3", from: "GEN",      fromPort: 0, to: "BRK_GEN",  toPort: 0 },
     { id: "E4", from: "BRK_GEN",  fromPort: 1, to: "BUS",      toPort: 1 },
-    // BUS → LOAD direct (AC path)
-    { id: "E5", from: "BUS", fromPort: 1, to: "LOAD", toPort: 0 },
-    // (Leave RECT1/INV1 unconnected in starter — you can connect in Editor)
-  ],
+    { id: "E5", from: "BUS",      fromPort: 1, to: "LOAD",     toPort: 0 }
+  ]
 };
 
-// ------- Port geometry (left/right) and semantics for converters -------
-type Port = { dx: number; dy: number; role?: "AC" | "DC" }; // role for rect/inv
+type Port = { dx: number; dy: number; role?: "AC" | "DC" };
 const PORTS: Record<NodeType, Port[]> = {
-  source:   [{ dx: 22, dy: 0 }],                // 1 port (right)
-  breaker:  [{ dx: -22, dy: 0 }, { dx: 22, dy: 0 }], // 2 ports (L/R)
+  source:   [{ dx: 22, dy: 0 }],
+  breaker:  [{ dx: -22, dy: 0 }, { dx: 22, dy: 0 }],
   bus:      [{ dx: -40, dy: 0 }, { dx: 40, dy: 0 }],
   load:     [{ dx: -26, dy: 0 }, { dx: 26, dy: 0 }],
-  rectifier:[{ dx: -26, dy: 0, role: "AC" }, { dx: 26, dy: 0, role: "DC" }], // AC in (L) → DC out (R)
-  inverter: [{ dx: -26, dy: 0, role: "DC" }, { dx: 26, dy: 0, role: "AC" }], // DC in (L) → AC out (R)
+  rectifier:[{ dx: -26, dy: 0, role: "AC" }, { dx: 26, dy: 0, role: "DC" }],
+  inverter: [{ dx: -26, dy: 0, role: "DC" }, { dx: 26, dy: 0, role: "AC" }]
 };
 
-// ------- Helpers -------
 const uid = (() => { let n = 0; return (p = "N") => p + String(++n); })();
-const mid = (a: number, b: number) => (a + b) / 2;
-
-// Snap-to-grid for nicer layouts
 const GRID = 10;
 const snap = (v: number) => Math.round(v / GRID) * GRID;
 
-// ------- Component -------
 export default function OneLineEditor({ lockedView = false }: { lockedView?: boolean }) {
   const [diagram, setDiagram] = useState<Diagram>(() => STARTER);
   const [selectedNode, setSelectedNode] = useState<NodeId | null>(null);
@@ -77,8 +67,8 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
   const [editingLabel, setEditingLabel] = useState<NodeId | null>(null);
   const [jsonIO, setJsonIO] = useState("");
 
-  // ---------- Energization + Signal Type (pin-graph BFS with state) ----------
-  type PinKey = string; // `${nodeId}#${portIndex}`
+  // ---------- Simulation (pin-graph BFS with AC/DC conversion) ----------
+  type PinKey = string; // `${node}#${port}`
   const pinKey = (id: NodeId, p: number) => `${id}#${p}`;
   const parsePin = (k: PinKey): [NodeId, number] => {
     const i = k.lastIndexOf("#");
@@ -86,72 +76,48 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
   };
 
   const sim = useMemo(() => {
-    const nodesById = new Map(diagram.nodes.map((n) => [n.id, n] as const));
-
-    // Build pin-to-pin adjacency. We'll carry Signal state during BFS.
+    const nodesById = new Map(diagram.nodes.map(n => [n.id, n] as const));
     const pinAdj = new Map<PinKey, PinKey[]>();
-    const pushAdj = (a: PinKey, b: PinKey) => {
-      if (!pinAdj.has(a)) pinAdj.set(a, []);
-      pinAdj.get(a)!.push(b);
-    };
+    const pushAdj = (a: PinKey, b: PinKey) => { if (!pinAdj.has(a)) pinAdj.set(a, []); pinAdj.get(a)!.push(b); };
 
-    // 1) Wires (edges) connect pin ↔ pin in both directions
+    // 1) Wires
     for (const e of diagram.edges) {
-      pushAdj(pinKey(e.from, e.fromPort), pinKey(e.to, e.toPort));
-      pushAdj(pinKey(e.to, e.toPort), pinKey(e.from, e.fromPort));
+      const A = pinKey(e.from, e.fromPort);
+      const B = pinKey(e.to, e.toPort);
+      pushAdj(A, B); pushAdj(B, A);
     }
 
-    // 2) Internal connectivity per node (breaker closed, bus tie-through, etc.)
+    // 2) Internal node connectivity
     for (const n of diagram.nodes) {
-      const ports = PORTS[n.type] ?? [];
+      const ports = PORTS[n.type] || [];
       if (n.type === "breaker") {
-        if (n.closed) {
-          // Connect L <-> R
-          if (ports.length >= 2) {
-            pushAdj(pinKey(n.id, 0), pinKey(n.id, 1));
-            pushAdj(pinKey(n.id, 1), pinKey(n.id, 0));
-          }
-        }
+        if (n.closed && ports.length >= 2) { pushAdj(pinKey(n.id, 0), pinKey(n.id, 1)); pushAdj(pinKey(n.id, 1), pinKey(n.id, 0)); }
       } else if (n.type === "bus" || n.type === "load") {
-        // Tie ports both ways (simple pass-through)
-        if (ports.length >= 2) {
-          pushAdj(pinKey(n.id, 0), pinKey(n.id, 1));
-          pushAdj(pinKey(n.id, 1), pinKey(n.id, 0));
-        }
+        if (ports.length >= 2) { pushAdj(pinKey(n.id, 0), pinKey(n.id, 1)); pushAdj(pinKey(n.id, 1), pinKey(n.id, 0)); }
       } else if (n.type === "rectifier") {
-        // Only AC(L) -> DC(R)
-        if (ports.length >= 2) {
-          pushAdj(pinKey(n.id, 0), pinKey(n.id, 1)); // directional
-        }
+        if (ports.length >= 2) { pushAdj(pinKey(n.id, 0), pinKey(n.id, 1)); } // AC(L)->DC(R)
       } else if (n.type === "inverter") {
-        // Only DC(L) -> AC(R)
-        if (ports.length >= 2) {
-          pushAdj(pinKey(n.id, 0), pinKey(n.id, 1)); // directional
-        }
+        if (ports.length >= 2) { pushAdj(pinKey(n.id, 0), pinKey(n.id, 1)); } // DC(L)->AC(R)
       }
-      // sources have only one output pin, no internal ties needed
     }
 
-    // 3) BFS over pins carrying Signal; conversions at rectifier/inverter
     type State = { pin: PinKey; sig: Signal };
     const reached = new Map<PinKey, Set<Signal>>();
     const q: State[] = [];
 
-    // Seed from all sources
+    // seeds (sources)
     for (const n of diagram.nodes) {
       if (n.type === "source" && n.sourceSignal) {
         const p0 = pinKey(n.id, 0);
-        q.push({ pin: p0, sig: n.sourceSignal });
         reached.set(p0, new Set([n.sourceSignal]));
+        q.push({ pin: p0, sig: n.sourceSignal });
       }
     }
 
     const addReach = (pin: PinKey, sig: Signal) => {
-      const s = reached.get(pin) ?? new Set<Signal>();
-      if (!s.has(sig)) {
-        s.add(sig);
-        reached.set(pin, s);
-        return true;
+      const set = reached.get(pin) ?? new Set<Signal>();
+      if (!set.has(sig)) {
+        set.add(sig); reached.set(pin, set); return true;
       }
       return false;
     };
@@ -160,9 +126,6 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
       const cur = q.shift()!;
       const [nodeId, portIdx] = parsePin(cur.pin);
       const node = nodesById.get(nodeId)!;
-
-      // If moving through a converter, enforce signal rules by port direction
-      const ports = PORTS[node.type] ?? [];
       const neighbors = pinAdj.get(cur.pin) || [];
 
       for (const nb of neighbors) {
@@ -171,67 +134,60 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
 
         let outSig: Signal | null = cur.sig;
 
+        // Conversion constraints are enforced when traversing inside the same node
         if (nbNode.id === node.id) {
-          // We're traversing inside the same node (internal link)
-          // Handle conversion when we traverse from L->R on rectifier/inverter
           if (node.type === "rectifier") {
-            // AC(L idx 0) -> DC(R idx 1)
+            // AC(L=0) -> DC(R=1)
             if (portIdx === 0 && nbPort === 1 && cur.sig === "AC") outSig = "DC";
-            else outSig = null; // block other internal directions/signals
+            else outSig = null;
           } else if (node.type === "inverter") {
-            // DC(L 0) -> AC(R 1)
+            // DC(L=0) -> AC(R=1)
             if (portIdx === 0 && nbPort === 1 && cur.sig === "DC") outSig = "AC";
             else outSig = null;
-          } else if (node.type === "breaker") {
-            // Already enforced by closed state: pass cur.sig
-          } else if (node.type === "bus" || node.type === "load") {
-            // Pass-through: cur.sig unchanged
           }
-        } else {
-          // Traversing a wire to a different node:
-          // For sources: nothing special. For others: signal stays the same here.
-          // Note: blocking will happen inside the next node if necessary.
+          // breaker/bus/load pass-through is already allowed by adjacency; no sig change
         }
 
-        if (outSig && addReach(nb, outSig)) {
-          q.push({ pin: nb, sig: outSig });
-        }
+        if (outSig && addReach(nb, outSig)) q.push({ pin: nb, sig: outSig });
       }
     }
 
-    // Derive energized flags
+    // derive node/edge energized & signal
     const nodeHot = new Set<NodeId>();
-    for (const [k, sigs] of reached) {
-      if (sigs.size > 0) nodeHot.add(parsePin(k)[0]);
-    }
-    // Edge energized + signal kind (AC or DC)
+    for (const k of reached.keys()) nodeHot.add(parsePin(k)[0]);
+
     const edgeHot = new Set<string>();
-    const edgeSig = new Map<string, Signal>("size" in Object ? [] : []); // TS hush
+    const edgeSig = new Map<string, Signal>();
     for (const e of diagram.edges) {
-      const a = pinKey(e.from, e.fromPort);
-      const b = pinKey(e.to, e.toPort);
-      const aS = reached.get(a);
-      const bS = reached.get(b);
-      if (aS && bS) {
+      const A = pinKey(e.from, e.fromPort);
+      const B = pinKey(e.to, e.toPort);
+      const as = reached.get(A);
+      const bs = reached.get(B);
+      if (as && bs) {
         edgeHot.add(e.id);
-        // If either side has DC, mark as DC, else AC.
-        const isDC = (aS.has("DC") || bS.has("DC")) && !(aS.has("AC") && bS.has("AC"));
+        // Mark DC if either side has DC and not both sides AC
+        const isDC = (as.has("DC") || bs.has("DC")) && !(as.has("AC") && bs.has("AC"));
         edgeSig.set(e.id, isDC ? "DC" : "AC");
       }
     }
 
-    return { reached, nodeHot, edgeHot, edgeSig, pinAdj, nodesById };
+    return { nodeHot, edgeHot, edgeSig };
   }, [diagram]);
 
   // ---------- UI actions ----------
+  function portXY(n: Node, idx: number) {
+    const p = (PORTS[n.type] || [])[idx] || { dx: 0, dy: 0 };
+    return { x: n.x + p.dx, y: n.y + p.dy };
+  }
+
   function addNode(type: NodeType) {
     if (lockedView) return;
-    const x = 120 + Math.random() * 520;
-    const y = 80 + Math.random() * 240;
+    const x = snap(120 + Math.random() * 520);
+    const y = snap(80 + Math.random() * 240);
     const id = uid(type[0].toUpperCase());
     const base = { source: "Source", breaker: "CB", bus: "Bus", load: "Load", rectifier: "Rectifier", inverter: "Inverter" }[type];
-    const node: Node = { id, type, x: snap(x), y: snap(y), label: `${base} ${id}` };
-    if (type === "source") node.sourceSignal = "AC";             // default AC source
+    const node: Node = { id, type, x, y, label: `${base} ${id}` };
+    if (type === "source") node.sourceSignal = "AC";
     if (type === "breaker") node.closed = true;
     setDiagram(d => ({ ...d, nodes: d.nodes.concat(node) }));
   }
@@ -239,7 +195,7 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
   function toggleBreaker(id: NodeId) {
     setDiagram(d => ({
       ...d,
-      nodes: d.nodes.map(n => n.id === id && n.type === "breaker" ? { ...n, closed: !n.closed } : n)
+      nodes: d.nodes.map(n => (n.id === id && n.type === "breaker" ? { ...n, closed: !n.closed } : n))
     }));
   }
 
@@ -257,29 +213,19 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
     const y = snap(e.clientY - drag.dy);
     setDiagram(d => ({
       ...d,
-      nodes: d.nodes.map(n => (n.id === drag.id ? { ...n, x, y } : n)),
+      nodes: d.nodes.map(n => (n.id === drag.id ? { ...n, x, y } : n))
     }));
   }
 
-  function onMouseUp() { dragging.current = null; setGhostPos(null); }
-
-  function portXY(n: Node, idx: number) {
-    const p = (PORTS[n.type] || [])[idx] || { dx: 0, dy: 0 };
-    return { x: n.x + p.dx, y: n.y + p.dy };
+  function onMouseUp() {
+    dragging.current = null;
+    setGhostPos(null);
   }
 
   function startConnect(nodeId: NodeId, port: number) {
     if (lockedView) return;
-    if (!connectFrom) {
-      setConnectFrom({ node: nodeId, port });
-      return;
-    }
-    // finish connection
-    if (connectFrom.node === nodeId && connectFrom.port === port) {
-      // same port → cancel
-      setConnectFrom(null); setGhostPos(null);
-      return;
-    }
+    if (!connectFrom) { setConnectFrom({ node: nodeId, port }); return; }
+    if (connectFrom.node === nodeId && connectFrom.port === port) { setConnectFrom(null); setGhostPos(null); return; }
     const id = uid("E");
     setDiagram(d => ({ ...d, edges: d.edges.concat({ id, from: connectFrom.node, fromPort: connectFrom.port, to: nodeId, toPort: port }) }));
     setConnectFrom(null);
@@ -299,7 +245,6 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
     setGhostPos(null);
   }
 
-  // keyboard delete/backspace (unless typing in inputs)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (document.activeElement as HTMLElement)?.tagName;
@@ -313,16 +258,13 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedNode]);
 
-  // inline rename save
   function renameNode(id: NodeId, label: string) {
     setDiagram(d => ({ ...d, nodes: d.nodes.map(n => (n.id === id ? { ...n, label } : n)) }));
   }
 
-  // ---------- Derived for starter cards ----------
   const busHot = sim.nodeHot.has("BUS");
   const loadHot = sim.nodeHot.has("LOAD");
 
-  // ---------- Render ----------
   return (
     <div
       className="w-full min-h-[620px] grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6 p-6 bg-neutral-50"
@@ -331,11 +273,10 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
     >
       <style>{`
         .conductor { stroke: #334155; stroke-width: 6; stroke-linecap: round; }
-        .energized { }
         .ac { stroke-dasharray: 10 12; animation: acdash 1.1s ease-in-out infinite alternate; }
-        @keyframes acdash { 0% { stroke-dashoffset: 0 } 100% { stroke-dashoffset: -22 } }
+        @keyframes acdash { 0% { stroke-dashoffset: 0; } 100% { stroke-dashoffset: -22; } }
         .dc { stroke-dasharray: 10 10; animation: dcmarch 1.2s linear infinite; }
-        @keyframes dcmarch { to { stroke-dashoffset: -20 } }
+        @keyframes dcmarch { to { stroke-dashoffset: -20; } }
         .node-hit { cursor: pointer; }
         .sel { filter: drop-shadow(0 0 6px rgba(99,102,241,.6)); }
         .port { fill: #94a3b8; cursor: crosshair; }
@@ -343,7 +284,7 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
         .ghost { stroke: #64748b; stroke-width: 2; stroke-dasharray: 4 6; }
       `}</style>
 
-      {/* Left: toolbar + canvas */}
+      {/* Left column: toolbar + canvas */}
       <div className="rounded-2xl bg-white shadow p-4 flex flex-col gap-3">
         {!lockedView && (
           <div className="flex flex-wrap items-center gap-2">
@@ -363,8 +304,8 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
             {selectedNode && (
               <button
                 className="px-3 py-1.5 rounded-xl border bg-red-50 border-red-300 text-red-800"
-                title="Delete selected node and attached lines"
                 onClick={deleteSelected}
+                title="Delete selected node and attached lines"
               >
                 Delete selected
               </button>
@@ -373,31 +314,30 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
         )}
 
         <svg viewBox="0 0 820 460" className="w-full h-[500px] rounded-xl bg-white">
-          {/* conductors */}
+          {/* Conductors */}
           {diagram.edges.map((e) => {
             const a = diagram.nodes.find(n => n.id === e.from)!;
             const b = diagram.nodes.find(n => n.id === e.to)!;
             const A = portXY(a, e.fromPort);
             const B = portXY(b, e.toPort);
             const hot = sim.edgeHot.has(e.id);
-            const sig = sim.edgeSig.get(e.id) || "AC";
+            const sig = (sim.edgeSig.get(e.id) || "AC");
             const cls = hot ? (sig === "DC" ? "dc" : "ac") : "";
             return (
-              <line key={e.id} x1={A.x} y1={A.y} x2={B.x} y2={B.y} className={`conductor energized ${cls}`} />
+              <line key={e.id} x1={A.x} y1={A.y} x2={B.x} y2={B.y} className={`conductor ${cls}`} />
             );
           })}
 
-          {/* ghost wire while connecting */}
+          {/* Ghost wire while aiming second port */}
           {!lockedView && connectFrom && ghostPos && (() => {
             const n = diagram.nodes.find(x => x.id === connectFrom.node)!;
             const p = portXY(n, connectFrom.port);
             return <line className="ghost" x1={p.x} y1={p.y} x2={ghostPos.x} y2={ghostPos.y} />;
           })()}
 
-          {/* nodes */}
+          {/* Nodes */}
           {diagram.nodes.map((n) => (
             <g key={n.id} transform={`translate(${n.x},${n.y})`}>
-              {/* hit area for dragging */}
               {!lockedView && (
                 <circle
                   r={28}
@@ -408,7 +348,7 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
                 />
               )}
 
-              {/* symbols */}
+              {/* Symbols */}
               {n.type === "source" && (
                 <g className={selectedNode === n.id ? "sel" : ""}>
                   <circle r={18} fill="#fff" stroke="#0f172a" strokeWidth={3} />
@@ -433,7 +373,6 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
                   className={(selectedNode === n.id ? "sel " : "") + "cursor-pointer"}
                   onDoubleClick={() => toggleBreaker(n.id)}
                 >
-                  {/* ANSI-ish: two terminals + blade */}
                   <circle cx={-14} cy={0} r={3} fill="#0f172a" />
                   <circle cx={14} cy={0} r={3} fill="#0f172a" />
                   {n.closed ? (
@@ -447,23 +386,21 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
 
               {n.type === "rectifier" && (
                 <g className={selectedNode === n.id ? "sel" : ""}>
-                  {/* left: AC symbol ~ ; right: DC symbol = */}
                   <text x={-14} y={-10} fontSize="12" textAnchor="middle">~</text>
-                  <text x={14} y={-10} fontSize="12" textAnchor="middle">=</text>
+                  <text x={14}  y={-10} fontSize="12" textAnchor="middle">=</text>
                   <rect x={-22} y={-16} width={44} height={32} rx={6} fill="#fff" stroke="#0f172a" strokeWidth={2} />
                 </g>
               )}
 
               {n.type === "inverter" && (
                 <g className={selectedNode === n.id ? "sel" : ""}>
-                  {/* left: DC = ; right: AC ~ */}
                   <text x={-14} y={-10} fontSize="12" textAnchor="middle">=</text>
-                  <text x={14} y={-10} fontSize="12" textAnchor="middle">~</text>
+                  <text x={14}  y={-10} fontSize="12" textAnchor="middle">~</text>
                   <rect x={-22} y={-16} width={44} height={32} rx={6} fill="#fff" stroke="#0f172a" strokeWidth={2} />
                 </g>
               )}
 
-              {/* label (inline rename) */}
+              {/* Label / inline rename */}
               {editingLabel === n.id ? (
                 <foreignObject x={-60} y={26} width={120} height={26}>
                   <input
@@ -477,3 +414,105 @@ export default function OneLineEditor({ lockedView = false }: { lockedView?: boo
                     style={{ width: "100%", fontSize: 12, padding: "2px 6px", border: "1px solid #cbd5e1", borderRadius: 6 }}
                   />
                 </foreignObject>
+              ) : (
+                <text
+                  x={0}
+                  y={32}
+                  textAnchor="middle"
+                  className="fill-slate-700 text-[12px] select-none"
+                  onDoubleClick={() => !lockedView && setEditingLabel(n.id)}
+                >
+                  {n.label}
+                </text>
+              )}
+
+              {/* Hot dot */}
+              <circle cx={0} cy={46} r={4} fill={sim.nodeHot.has(n.id) ? "#16a34a" : "#94a3b8"} />
+
+              {/* Ports (editor only) */}
+              {!lockedView && (PORTS[n.type] || []).map((p, idx) => (
+                <circle
+                  key={`${n.id}-p${idx}`}
+                  className={"port " + (/* simple highlight if energized at either port */ sim.nodeHot.has(n.id) ? "hot" : "")}
+                  cx={p.dx}
+                  cy={p.dy}
+                  r={4}
+                  onClick={(e) => { e.stopPropagation(); startConnect(n.id, idx); }}
+                />
+              ))}
+            </g>
+          ))}
+        </svg>
+      </div>
+
+      {/* Right column: panel */}
+      <div className="rounded-2xl bg-white shadow p-5 flex flex-col gap-4">
+        <h2 className="text-xl font-semibold tracking-tight">Panel</h2>
+
+        <div className="mt-1 grid grid-cols-2 gap-2 text-sm">
+          <div className="rounded-lg bg-slate-50 px-3 py-2 border border-slate-200">
+            <div className="text-slate-500">Bus (starter)</div>
+            <div className={"font-semibold " + (busHot ? "text-green-600" : "text-slate-700")}>
+              {busHot ? "Energized" : "De-energized"}
+            </div>
+          </div>
+          <div className="rounded-lg bg-slate-50 px-3 py-2 border border-slate-200">
+            <div className="text-slate-500">Load (starter)</div>
+            <div className={"font-semibold " + (loadHot ? "text-green-600" : "text-slate-700")}>
+              {loadHot ? "Energized" : "De-energized"}
+            </div>
+          </div>
+        </div>
+
+        {!lockedView && selectedNode && (
+          <div className="flex gap-2 mt-2">
+            <button
+              className="px-3 py-1.5 rounded-xl border bg-red-50 border-red-300 text-red-800"
+              onClick={deleteSelected}
+              title="Delete selected node and its connected lines"
+            >
+              Delete selected
+            </button>
+          </div>
+        )}
+
+        {!lockedView && (
+          <div className="mt-2">
+            <div className="text-sm font-medium mb-1">Import / Export JSON</div>
+            <textarea
+              className="w-full h-32 p-2 font-mono text-xs border rounded-md"
+              value={jsonIO}
+              onChange={(e) => setJsonIO(e.target.value)}
+              placeholder="Click Export to dump, paste JSON here then Load to import."
+            />
+            <div className="mt-2 flex gap-2">
+              <button
+                className="px-3 py-1.5 rounded-xl border bg-slate-50 border-slate-300"
+                onClick={() => {
+                  try {
+                    const obj = JSON.parse(jsonIO) as Diagram;
+                    if (!obj.nodes || !obj.edges) throw new Error("Bad diagram JSON");
+                    setDiagram(obj);
+                  } catch (err) { alert("Load failed: " + String(err)); }
+                }}
+              >
+                Load
+              </button>
+              <button
+                className="px-3 py-1.5 rounded-xl border bg-slate-50 border-slate-300"
+                onClick={() => setJsonIO(JSON.stringify(diagram, null, 2))}
+              >
+                Export
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-auto text-xs text-slate-500 leading-relaxed">
+          <p><strong>Tips:</strong> Drag devices to move (snap-to-grid). Click a port, then another port to connect (watch the ghost wire). Double-click a breaker to toggle. Double-click a label to rename.</p>
+          <p className="mt-2"><strong>AC vs DC:</strong> AC wires wobble back-and-forth; DC wires march in one direction. Rectifier converts AC→DC (left→right). Inverter converts DC→AC (left→right). Sources default to AC.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
